@@ -1,4 +1,4 @@
-[![progress-banner](https://backend.codecrafters.io/progress/redis/1ba29d0f-7129-4e8e-93a2-60f9041596f8)](https://app.codecrafters.io/users/codecrafters-bot?r=2qF)
+<!-- [![progress-banner](https://backend.codecrafters.io/progress/redis/1ba29d0f-7129-4e8e-93a2-60f9041596f8)](https://app.codecrafters.io/users/codecrafters-bot?r=2qF)
 
 This is a starting point for C++ solutions to the
 ["Build Your Own Redis" Challenge](https://codecrafters.io/challenges/redis).
@@ -30,4 +30,4 @@ Note: This section is for stages 2 and beyond.
 1. Run `./your_program.sh` to run your Redis server, which is implemented in
    `src/main.cpp`.
 1. Commit your changes and run `git push origin master` to submit your solution
-   to CodeCrafters. Test output will be streamed to your terminal.
+   to CodeCrafters. Test output will be streamed to your terminal. -->

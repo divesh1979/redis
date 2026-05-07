@@ -1,138 +1,59 @@
 #include <arpa/inet.h>
-#include <cstdlib>
+#include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <iostream>
-#include <istream>
+#include <map>
 #include <netdb.h>
+#include <ostream>
+#include <poll.h>
 #include <sstream>
-#include <stdexcept>
+#include <string>
 #include <sys/socket.h>
 #include <sys/types.h>
-#include <thread>
 #include <unistd.h>
-#include <variant>
 #include <vector>
 
-struct RespElement {
-  using Value = std::variant<long long, std::string, std::vector<RespElement>>;
-  Value data_;
-};
+std::map<std::string, std::string> gStorage;
 
-class RespParser {
-public:
-  static RespElement parse(std::istream &is) {
-    char marker = is.get();
-    if (is.eof())
-      throw std::runtime_error("End of input");
-
-    switch (marker) {
-    case ':':
-      return {parse_int(is)};
-    case '+':
-    case '-':
-      return {parse_line(is)};
-    case '$':
-      return {parse_bulk(is)};
-    case '*':
-      return {parse_array(is)};
-    default:
-      throw std::runtime_error("Uknown Marker");
-    }
-  }
-
-private:
-  static std::string parse_line(std::istream &is) {
-    std::string line;
-    if (!std::getline(is, line))
-      throw std::runtime_error("Failed to parse_line");
+std::string respParser(std::string s) {
+  std::vector<std::string> out;
+  std::istringstream iss(std::move(s));
+  std::string line;
+  while (std::getline(iss, line)) {
     if (!line.empty() && line.back() == '\r')
       line.pop_back();
-
-    return line;
+    out.push_back(line);
   }
 
-  static long long parse_int(std::istream &is) {
-    return std::stoll(parse_line(is));
+  if (out.size() < 4) {
+    return "+PONG\r\n";
   }
 
-  static std::string parse_bulk(std::istream &is) {
-    int len = std::stoi(parse_line(is));
-    if (len == 1)
-      return "NULL";
+  std::string command = out[2];
 
-    std::vector<char> buffer(len);
-    is.read(buffer.data(), len);
-    is.ignore(2);
-    return std::string(begin(buffer), end(buffer));
+  for (auto &x : command) {
+    x = std::tolower(x);
   }
 
-  static std::vector<RespElement> parse_array(std::istream &is) {
-    int count = std::stoi(parse_line(is));
+  std::cout << command;
 
-    std::vector<RespElement> elements;
-
-    if (count == -1)
-      return elements;
-
-    for (int i = 0; i < count; i++) {
-      elements.push_back(parse(is));
-    }
-
-    return elements;
+  std::ostringstream response;
+  if (command == "echo") {
+    response << out[3] << "\r\n" << out[4] << "\r\n";
+    return response.str();
+  } else if (command == "set") {
+    gStorage[out[4]] = out[6];
+    return "+OK\r\n";
+  } else if (command == "get") {
+    response << "$" << gStorage.at(out[4]).length() << "\r\n"
+             << gStorage.at(out[4]) << "\r\n";
+    return response.str();
   }
-};
-
-void handle_client(int client_socket_addr) {
-  char buffer[1024];
-  while (true) {
-
-    std::memset(buffer, 0, sizeof(buffer));
-    int bytes_recieved = recv(client_socket_addr, buffer, sizeof(buffer), 0);
-    if (bytes_recieved <= 0) {
-      break;
-    }
-
-    std::string raw_data(buffer, bytes_recieved);
-
-    std::istringstream iss(raw_data);
-
-    try {
-      RespElement result = RespParser::parse(iss);
-      std::string command;
-
-      if (auto *vec = std::get_if<std::vector<RespElement>>(&result.data_)) {
-        if (!vec->empty()) {
-          if (auto *cmd_ptr = std::get_if<std::string>(&((*vec)[0].data_))) {
-            command = *cmd_ptr;
-          }
-        }
-
-        if (command == "PING") {
-          const char *response = "+PONG\r\n";
-          send(client_socket_addr, response, strlen(response), 0);
-        } else if (command == "ECHO" && vec->size() > 1) {
-          if (auto *msg_ptr = std::get_if<std::string>(&((*vec)[1].data_))) {
-            std::string response = "$" + std::to_string(msg_ptr->length()) +
-                                   "\r\n" + *msg_ptr + "\r\n";
-            send(client_socket_addr, response.c_str(), response.length(), 0);
-          }
-        }
-      } else if (auto *str_ptr = std::get_if<std::string>(&result.data_)) {
-        command = *str_ptr;
-      }
-
-    } catch (...) {
-      const char *error = "-ERR protocol error\r\n";
-      send(client_socket_addr, error, strlen(error), 0);
-    }
-  }
+  return command;
 }
 
-int main(int argc, char **argv) {
-  // Flush after every std::cout / std::cerr
-  std::cout << std::unitbuf;
-  std::cerr << std::unitbuf;
-
+int createListeningSocket(uint16_t port) {
   int server_fd = socket(AF_INET, SOCK_STREAM, 0);
   if (server_fd < 0) {
     std::cerr << "Failed to create server socket\n";
@@ -140,6 +61,7 @@ int main(int argc, char **argv) {
   }
 
   int reuse = 1;
+
   if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) <
       0) {
     std::cerr << "setsockopt failed\n";
@@ -149,7 +71,7 @@ int main(int argc, char **argv) {
   struct sockaddr_in server_addr;
   server_addr.sin_family = AF_INET;
   server_addr.sin_addr.s_addr = INADDR_ANY;
-  server_addr.sin_port = htons(6379);
+  server_addr.sin_port = htons(port);
 
   if (bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) !=
       0) {
@@ -163,26 +85,58 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  struct sockaddr_in client_addr;
-  int client_addr_len = sizeof(client_addr);
-  std::cout << "Waiting for a client to connect...\n";
+  return server_fd;
+}
 
-  std::cout << "Logs from your program will appear here!\n";
+int main(int argc, char **argv) {
+  std::cout << std::unitbuf;
+  std::cerr << std::unitbuf;
 
-  std::vector<std::thread> addresses;
+  int server_fd{createListeningSocket(6379)};
+  std::vector<pollfd> fds;
 
-  while (true) {
+  fds.push_back(pollfd{server_fd, POLLIN, 0});
+  for (;;) {
+    int rc = poll(fds.data(), fds.size(), -1);
+    if (rc < 0) {
+      if (errno == EINTR)
+        continue;
+      std::cerr << "poll: " << std::strerror(errno) << "\n";
+      break;
+    }
 
-    int client_socket = accept(server_fd, (struct sockaddr *)&client_addr,
-                               (socklen_t *)&client_addr_len);
+    if (fds[0].revents & POLLIN) {
+      int client = accept(server_fd, nullptr, nullptr);
+      if (client >= 0) {
+        fds.push_back(pollfd{client, POLLIN, 0});
+        std::cout << "client fd " << client << " connected\n";
+      }
+    }
 
-    if (client_socket >= 0) {
+    for (size_t i = 1; i < fds.size(); ++i) {
+      if (fds[i].fd == -1)
+        continue;
 
-      std::thread t(handle_client, client_socket);
-      t.detach();
+      if (fds[i].revents & (POLLHUP | POLLERR | POLLNVAL)) {
+        close(fds[i].fd);
+        fds[i].fd = -1;
+        continue;
+      }
+
+      if (fds[i].revents & POLLIN) {
+        char buf[4096];
+        ssize_t n = read(fds[i].fd, buf, sizeof(buf));
+        const std::string pong = respParser(buf);
+        if (n == 0) {
+          std::cout << "client fd " << fds[i].fd << " closed\n";
+          close(fds[i].fd);
+          fds[i].fd = -1;
+        } else if (n > 0) {
+          send(fds[i].fd, pong.c_str(), pong.length(), 0);
+        }
+      }
     }
   }
-
   close(server_fd);
 
   return 0;

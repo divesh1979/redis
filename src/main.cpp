@@ -1,143 +1,155 @@
-#include <arpa/inet.h>
-#include <cerrno>
-#include <cstdint>
-#include <cstring>
 #include <iostream>
-#include <map>
-#include <netdb.h>
-#include <ostream>
-#include <poll.h>
-#include <sstream>
+#include <cstdlib>
 #include <string>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
+#include <cstring>
 #include <vector>
+#include <unordered_map>
+#include <chrono>
+#include <mutex>
+#include <thread>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <netdb.h>
 
-std::map<std::string, std::string> gStorage;
+std::unordered_map<std::string, std::pair<std::string, std::chrono::steady_clock::time_point>> kv_store;
+std::mutex kv_mutex;
 
-std::string respParser(std::string s) {
-  std::vector<std::string> out;
-  std::istringstream iss(std::move(s));
-  std::string line;
-  while (std::getline(iss, line)) {
-    if (!line.empty() && line.back() == '\r')
-      line.pop_back();
-    out.push_back(line);
-  }
+std::vector<std::string> parse_redis_command(int client_fd) {
+    std::vector<std::string> result;
+    char buffer[1024];
+    int bytes_read = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
+    if (bytes_read <= 0) return result;
 
-  if (out.size() < 4) {
-    return "+PONG\r\n";
-  }
+    buffer[bytes_read] = '\0';
+    std::string input(buffer);
+    size_t pos = 0;
 
-  std::string command = out[2];
+    if (input[pos] != '*') return result;
 
-  for (auto &x : command) {
-    x = std::tolower(x);
-  }
+    pos++;
+    int num_elems = std::stoi(input.substr(pos));
+    pos = input.find("\r\n", pos) + 2;
 
-  std::cout << command;
+    for (int i = 0; i < num_elems; ++i) {
+        if (input[pos] != '$') return result;
+        pos++;
+        int len = std::stoi(input.substr(pos));
+        pos = input.find("\r\n", pos) + 2;
+        result.push_back(input.substr(pos, len));
+        pos += len + 2; // Skip \r\n
+    }
 
-  std::ostringstream response;
-  if (command == "echo") {
-    response << out[3] << "\r\n" << out[4] << "\r\n";
-    return response.str();
-  } else if (command == "set") {
-    gStorage[out[4]] = out[6];
-    return "+OK\r\n";
-  } else if (command == "get") {
-    response << "$" << gStorage.at(out[4]).length() << "\r\n"
-             << gStorage.at(out[4]) << "\r\n";
-    return response.str();
-  }
-  return command;
+    return result;
 }
 
-int createListeningSocket(uint16_t port) {
-  int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (server_fd < 0) {
-    std::cerr << "Failed to create server socket\n";
-    return 1;
-  }
+void handle_client(int client_fd) {
+    while (true) {
+        std::vector<std::string> parts = parse_redis_command(client_fd);
+        if (parts.empty()) break;
 
-  int reuse = 1;
+        std::string command = parts[0];
+        for (char &c : command) c = toupper(c);
 
-  if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) <
-      0) {
-    std::cerr << "setsockopt failed\n";
-    return 1;
-  }
+        if (command == "PING") {
+            std::string response = "+PONG\r\n";
+            send(client_fd, response.c_str(), response.size(), 0);
+        } else if (command == "ECHO" && parts.size() == 2) {
+            std::string msg = parts[1];
+            std::string response = "$" + std::to_string(msg.size()) + "\r\n" + msg + "\r\n";
+            send(client_fd, response.c_str(), response.size(), 0);
+        } else if (command == "SET" && parts.size() >= 3) {
+            std::string key = parts[1];
+            std::string value = parts[2];
+            std::chrono::steady_clock::time_point expiry_time = std::chrono::steady_clock::time_point::max();
 
-  struct sockaddr_in server_addr;
-  server_addr.sin_family = AF_INET;
-  server_addr.sin_addr.s_addr = INADDR_ANY;
-  server_addr.sin_port = htons(port);
+            if (parts.size() >= 5 && strcasecmp(parts[3].c_str(), "px") == 0) {
+                int expiry_ms = std::stoi(parts[4]);
+                expiry_time = std::chrono::steady_clock::now() + std::chrono::milliseconds(expiry_ms);
+            }
 
-  if (bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) !=
-      0) {
-    std::cerr << "Failed to bind to port 6379\n";
-    return 1;
-  }
+            {
+                std::lock_guard<std::mutex> lock(kv_mutex);
+                kv_store[key] = {value, expiry_time};
+            }
 
-  int connection_backlog = 5;
-  if (listen(server_fd, connection_backlog) != 0) {
-    std::cerr << "listen failed\n";
-    return 1;
-  }
+            std::string response = "+OK\r\n";
+            send(client_fd, response.c_str(), response.size(), 0);
+        } else if (command == "GET" && parts.size() == 2) {
+            std::string key = parts[1];
+            std::string response;
 
-  return server_fd;
+            {
+                std::lock_guard<std::mutex> lock(kv_mutex);
+                auto it = kv_store.find(key);
+                if (it != kv_store.end()) {
+                    auto [value, expiry_time] = it->second;
+                    if (std::chrono::steady_clock::now() >= expiry_time) {
+                        kv_store.erase(it);
+                        response = "$-1\r\n";
+                    } else {
+                        response = "$" + std::to_string(value.size()) + "\r\n" + value + "\r\n";
+                    }
+                } else {
+                    response = "$-1\r\n";
+                }
+            }
+
+            send(client_fd, response.c_str(), response.size(), 0);
+        } else {
+            std::string response = "-ERR unknown command\r\n";
+            send(client_fd, response.c_str(), response.size(), 0);
+        }
+    }
+
+    close(client_fd);
 }
 
 int main(int argc, char **argv) {
-  std::cout << std::unitbuf;
-  std::cerr << std::unitbuf;
+    std::cout << std::unitbuf;
+    std::cerr << std::unitbuf;
 
-  int server_fd{createListeningSocket(6379)};
-  std::vector<pollfd> fds;
-
-  fds.push_back(pollfd{server_fd, POLLIN, 0});
-  for (;;) {
-    int rc = poll(fds.data(), fds.size(), -1);
-    if (rc < 0) {
-      if (errno == EINTR)
-        continue;
-      std::cerr << "poll: " << std::strerror(errno) << "\n";
-      break;
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        std::cerr << "Failed to create server socket\n";
+        return 1;
     }
 
-    if (fds[0].revents & POLLIN) {
-      int client = accept(server_fd, nullptr, nullptr);
-      if (client >= 0) {
-        fds.push_back(pollfd{client, POLLIN, 0});
-        std::cout << "client fd " << client << " connected\n";
-      }
+    int reuse = 1;
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
+        std::cerr << "setsockopt failed\n";
+        return 1;
     }
 
-    for (size_t i = 1; i < fds.size(); ++i) {
-      if (fds[i].fd == -1)
-        continue;
+    struct sockaddr_in server_addr;
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+    server_addr.sin_port = htons(6379);
 
-      if (fds[i].revents & (POLLHUP | POLLERR | POLLNVAL)) {
-        close(fds[i].fd);
-        fds[i].fd = -1;
-        continue;
-      }
+    if (bind(server_fd, (struct sockaddr *) &server_addr, sizeof(server_addr)) != 0) {
+        std::cerr << "Failed to bind to port 6379\n";
+        return 1;
+    }
 
-      if (fds[i].revents & POLLIN) {
-        char buf[4096];
-        ssize_t n = read(fds[i].fd, buf, sizeof(buf));
-        const std::string pong = respParser(buf);
-        if (n == 0) {
-          std::cout << "client fd " << fds[i].fd << " closed\n";
-          close(fds[i].fd);
-          fds[i].fd = -1;
-        } else if (n > 0) {
-          send(fds[i].fd, pong.c_str(), pong.length(), 0);
+    if (listen(server_fd, 5) != 0) {
+        std::cerr << "listen failed\n";
+        return 1;
+    }
+
+    std::cout << "Server is running on port 6379...\n";
+
+    while (true) {
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+        int client_fd = accept(server_fd, (struct sockaddr *) &client_addr, &client_len);
+        if (client_fd < 0) {
+            std::cerr << "Failed to accept client\n";
+            continue;
         }
-      }
+        std::thread(handle_client, client_fd).detach();
     }
-  }
-  close(server_fd);
 
-  return 0;
+    close(server_fd);
+    return 0;
 }

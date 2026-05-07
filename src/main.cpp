@@ -7,6 +7,19 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include<thread>
+
+void handle_client(int client_fd) {
+  std::string response = "+PONG\r\n";
+  while (true) {
+    char buffer[1024] = {0};
+    ssize_t bytes_received = recv(client_fd, buffer, sizeof(buffer), 0);
+    if (bytes_received <= 0)
+      break;
+    send(client_fd, response.c_str(), response.size(), 0);
+  }
+  close(client_fd);
+}
 
 int main(int argc, char **argv) {
   // Flush after every std::cout / std::cerr
@@ -48,25 +61,24 @@ int main(int argc, char **argv) {
   struct sockaddr_in client_addr;
   int client_addr_len = sizeof(client_addr);
   std::cout << "Waiting for a client to connect...\n";
+  
 
-  // You can use print statements as follows for debugging, they'll be visible
-  // when running tests.
-  std::cout << "Logs from your program will appear here!\n";
+   while (true) {
+    struct sockaddr_in client_addr;
+    int client_addr_len = sizeof(client_addr);
 
-  // Uncomment the code below to pass the first stage
-  int client_fd = accept(server_fd, (struct sockaddr *)&client_addr,
-                         (socklen_t *)&client_addr_len);
-  std::cout << "Client connected\n";
-  char buffer[1024];
-  while (true) {
-    int bytes_recieved = recv(client_fd, buffer, sizeof(buffer), 0);
-    if (bytes_recieved <= 0) {
-      break;
+    int client_fd = accept(server_fd, (struct sockaddr *)&client_addr,
+                           (socklen_t *)&client_addr_len);
+
+    if (client_fd < 0) {
+      std::cerr << "failed\n";
+      continue;
     }
-    const char *response = "+PONG\r\n";
-    send(client_fd, response, strlen(response), 0);
+
+    std::cout << "Client connected\n";
+    std::thread(handle_client, client_fd).detach();
   }
-  close(client_fd);
+
   close(server_fd);
   return 0;
 }

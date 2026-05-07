@@ -51,26 +51,16 @@ int main(int argc, char **argv) {
   std::cout << "Logs from your program will appear here!\n";
 
   // Uncomment the code below to pass the first stage
-   
-   accept(server_fd, (struct sockaddr *) &client_addr, (socklen_t *) &client_addr_len);
-   std::cout << "Client connected\n";
-   
-   close(server_fd);
-  int client_fd=accept(server_fd, (struct sockaddr *) &client_addr, (socklen_t *) &client_addr_len);
+  // 
+  // accept(server_fd, (struct sockaddr *) &client_addr, (socklen_t *) &client_addr_len);
+  // std::cout << "Client connected\n";
+  // 
+  // close(server_fd);
+  int client_fd = accept(server_fd, (struct sockaddr *) &client_addr, (socklen_t *) &client_addr_len);
   std::cout << "Client connected\n";
-  char buffer[1024]={0};
-  while (true){
-  int bytes_read=read(client_fd,buffer, sizeof(buffer));
-  if (bytes_read <0){
-    std::cerr << "failed to read\n";
-    return 1;
-  }
-  std::string request(buffer);
-  if (request.find("PING")!=std::string::npos){
-    std::string respond ("+PONG\r\n");
-    write(client_fd,respond.c_str(),respond.size());
-  }
-}
+  const char *response = "+PONG\r\n";
+  send(client_fd, response, strlen(response), 0);
+  close(client_fd);
   close(server_fd);
   return 0;
 }
